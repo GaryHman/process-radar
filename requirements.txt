@@ -1,0 +1,4 @@
+# Process Radar - PySide6 for the window, psutil for process/port/CPU/RAM data
+# (GPU data comes from nvidia-smi and Windows performance counters via ctypes - no extra packages)
+PySide6-Essentials>=6.6
+psutil>=5.9
