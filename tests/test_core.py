@@ -3,11 +3,11 @@ import json
 import pytest
 
 import radar_core as rc
-from fakes import COMFY, MB, NOW, P, demo_snapshot
+from fakes import COMFY, MB, NOW, P, meneer_snapshot
 
 
 def statuses(snap=None):
-    return {s.key: s for s in rc.service_status(snap or demo_snapshot(), NOW)}
+    return {s.key: s for s in rc.service_status(snap or meneer_snapshot(), NOW)}
 
 
 def test_ollama_running_with_port_vram_and_models():
@@ -27,19 +27,19 @@ def test_comfyui_detected_with_actual_port():
 
 
 def test_comfyui_on_other_port_reads_listening_port():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     snap.procs[8304].listen = [("127.0.0.1", 8200)]
     assert statuses(snap)["comfyui"].ports == [(8200, "http://localhost:8200")]
 
 
 def test_comfyui_not_listening_yet_mentions_cmdline_port():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     snap.procs[8304].listen = []
     assert "8188" in statuses(snap)["comfyui"].detail
 
 
 def test_stopped_services_have_badge_data():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     for pid in (8304, 7564):
         del snap.procs[pid]
     st = statuses(snap)
@@ -80,7 +80,7 @@ def test_python_main_py_outside_comfy_is_not_comfyui():
 
 
 def test_noise_and_listing_rules():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     rows = {p.pid: why for p, why in rc.background_rows(snap)}
     # system noise is hidden
     assert 4 not in rows and 1316 not in rows and 7564 not in rows and 10648 not in rows
@@ -96,7 +96,7 @@ def test_noise_and_listing_rules():
 
 
 def test_friendly_labels():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     lab = {pid: rc.friendly_label(p) for pid, p in snap.procs.items()}
     assert lab[14672] == "Ollama" and lab[15000] == "Ollama (model runner)"
     assert lab[8304] == "ComfyUI"
@@ -108,14 +108,14 @@ def test_friendly_labels():
 
 
 def test_descendants_for_kill_tree():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     assert sorted(rc.descendants(8184, snap.procs)) == [5848, 7564, 8304]
     assert rc.descendants(8304, snap.procs) == [7564]
     assert rc.descendants(30001, snap.procs) == []
 
 
 def test_folder_for():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     assert rc.folder_for(snap.procs[8304]) == COMFY + r"\ComfyUI"
     assert rc.folder_for(snap.procs[5848]).endswith("Locally Uncensored")
     p = P(1, "python.exe", ["python", r"C:\bots\run\bot.py"], exe=r"C:\Python314\python.exe")
@@ -134,7 +134,7 @@ def test_formatting():
 
 
 def test_short_cmdline_hides_long_paths():
-    p = demo_snapshot().procs[8304]
+    p = meneer_snapshot().procs[8304]
     short = rc.short_cmdline(p, 200)
     assert short.startswith("python.exe main.py --listen 127.0.0.1 --port 8188")
     assert "ComfyUI_windows_portable" not in short
@@ -175,10 +175,10 @@ def test_parse_ollama_ps():
 
 
 def test_vram_unknown_when_no_source():
-    st = statuses(demo_snapshot(vram=False))
+    st = statuses(meneer_snapshot(vram=False))
     assert st["comfyui"].vram is None and st["ollama"].vram is None
 
 
 def test_report_text_contains_services():
-    t = rc.report_text(demo_snapshot(), NOW)
+    t = rc.report_text(meneer_snapshot(), NOW)
     assert "Ollama" in t and "RUNNING" in t and "ComfyUI" in t and "8188" in t and "RTX A4500" in t

@@ -263,6 +263,22 @@ def _cmd_has(*needles: str) -> Callable[[ProcInfo], bool]:
     return lambda p: any(n in (cmd_lower(p) + " " + (p.exe or "").lower()) for n in needles)
 
 
+# A runtime process (node / bun / python) only belongs to a service when the *program it runs* is that
+# service - not when the service name merely appears somewhere in its command line (a folder called
+# "opencode-state" or "openclaw-workspace" must not turn every script in it into opencode / OpenClaw).
+def _runs(p: ProcInfo, runtimes: tuple, names: tuple = (), pkgs: tuple = ()) -> bool:
+    """True if runtime process p runs a script/module whose file name starts with one of `names`, or whose
+    path contains one of the package folders in `pkgs` (e.g. '\\node_modules\\opencode')."""
+    if RUNTIME_LABEL.get(p.base) not in runtimes:
+        return False
+    sc = script_of(p).lower().replace("/", "\\")
+    if sc.startswith("-m "):
+        mod = sc[3:].strip()
+        return any(mod == n or mod.startswith(n + ".") for n in names)
+    base = sc.rsplit("\\", 1)[-1]
+    return any(base.startswith(n) for n in names) or any(k in sc for k in pkgs)
+
+
 @dataclass
 class ServiceDef:
     key: str
@@ -290,16 +306,18 @@ SERVICES: list[ServiceDef] = [
     ServiceDef("textgen", "Text Generation WebUI", "oobabooga", 7860,
                _py_with("text-generation-webui", "text_generation_webui", script=("server.py", "one_click.py"))),
     ServiceDef("openwebui", "Open WebUI", "Chat UI for Ollama", 8080,
-               lambda p: "open-webui" in cmd_lower(p) or "open_webui" in cmd_lower(p)),
+               lambda p: p.base in ("open-webui", "open_webui")
+               or _runs(p, ("Python",), names=("open-webui", "open_webui"))),
     ServiceDef("jupyter", "Jupyter", "Notebook / Lab server", 8888,
                lambda p: bool(re.search(r"jupyter(-lab|-notebook|-server|lab|\s+lab|\s+notebook)|"
                                         r"ipykernel_launcher|jupyterlab", cmd_lower(p)))
                or p.base in ("jupyter", "jupyter-lab", "jupyter-notebook")),
     ServiceDef("opencode", "opencode", "AI coding agent server", None,
-               lambda p: p.base.startswith("opencode") or "\\opencode" in cmd_lower(p)
-               and RUNTIME_LABEL.get(p.base) in ("Node.js", "Bun")),
+               lambda p: p.base.startswith("opencode") or _runs(p, ("Node.js", "Bun"), names=("opencode",),
+                                                    pkgs=("\\node_modules\\opencode", "\\opencode-ai\\", "\\.opencode\\bin\\"))),
     ServiceDef("openclaw", "OpenClaw", "Agent gateway", 18789,
-               lambda p: "openclaw" in p.base or "openclaw" in cmd_lower(p)),
+               lambda p: "openclaw" in p.base or _runs(p, ("Node.js", "Bun", "Python"), names=("openclaw",),
+                                                    pkgs=("\\node_modules\\openclaw",))),
     ServiceDef("docker", "Docker", "Docker Desktop / engine", None,
                _name_in("docker desktop", "com.docker.backend", "com.docker.build", "dockerd",
                         "com.docker.service", "docker")),
@@ -440,6 +458,8 @@ class ServiceStatus:
     uptime: float | None
     detail: str = ""
     group: bool = False
+    launcher: str = ""                 # "Locally Uncensored" when that app started these processes
+    launcher_pid: int | None = None
 
     def line(self) -> str:
         state = "RUNNING" if self.running else "stopped"
@@ -447,13 +467,15 @@ class ServiceStatus:
         pids = ",".join(str(p) for p in self.pids[:6]) + ("…" if len(self.pids) > 6 else "")
         vram = format_bytes(self.vram) if self.vram is not None else "n/a"
         return (f"{self.label:<22} {state:<8} pids={pids or '-':<18} ports={ports:<12} "
-                f"vram={vram:<9} ram={format_bytes(self.rss) if self.running else '-':<9} {self.detail}")
+                f"vram={vram:<9} ram={format_bytes(self.rss) if self.running else '-':<9} {self.detail}"
+                + (f"  (via {self.launcher})" if self.launcher else "")).rstrip()
 
 
 def service_status(snap: Snapshot, now: float) -> list[ServiceStatus]:
     out = []
+    owner = {pid: service_of(p) for pid, p in snap.procs.items()}     # classify every process once
     for s in SERVICES:
-        procs = [p for p in snap.procs.values() if (s.match(p) if s.group else service_of(p) is s)]
+        procs = [p for p in snap.procs.values() if (s.match(p) if s.group else owner[p.pid] is s)]
         ports: dict[int, str] = {}
         for p in procs:
             for port, url in urls_for(p):
@@ -472,8 +494,58 @@ def service_status(snap: Snapshot, now: float) -> list[ServiceStatus]:
         elif s.key == "comfyui" and procs and not ports:
             guess = cmdline_port(procs[0]) or s.default_port
             st.detail = f"not listening yet (expects port {guess})"
+        if procs and not s.group:
+            st.launcher, st.launcher_pid = service_launcher(procs, snap.procs, s.key)
         out.append(st)
     return out
+
+
+# Processes that only pass a launch along (shells, consoles, launchers) - look through them.
+_PASS_THROUGH = {"cmd", "conhost", "powershell", "pwsh", "openconsole", "windowsterminal", "wt", "py", "pyw",
+                 "bash", "sh", "wsl", "rundll32", "uv", "uvx", "npx"}
+# Reaching one of these means "started by you / by Windows", not by another app.
+_USER_ROOTS = {"explorer", "services", "svchost", "wininit", "winlogon", "userinit", "taskeng", "taskhostw",
+               "sihost", "runtimebroker", "startmenuexperiencehost"}
+
+
+def launcher_of(p: ProcInfo, procs: dict, own_key: str | None = None, max_depth: int = 8):
+    """The app that started p, as (label, pid), or ("", None) when it was started from Explorer/Windows.
+
+    Walks the parent chain; a parent only counts if it started before the child (protects against a
+    recycled parent PID). Shells/consoles/launchers are looked through; plain runtimes (node, python)
+    without a label are skipped too, so 'cmd -> node -> cmd -> locally-uncensored' gives Locally Uncensored."""
+    cur, seen = p, {p.pid}
+    for _ in range(max_depth):
+        par = procs.get(cur.ppid)
+        if par is None or par.pid in seen or par.pid in (0, 4):
+            return "", None
+        if par.create_time and cur.create_time and par.create_time > cur.create_time + 1:
+            return "", None                      # PID was reused: the real parent is gone
+        seen.add(par.pid)
+        if par.base in _USER_ROOTS:
+            return "", None
+        svc = service_of(par)
+        if svc is not None:
+            if svc.key != own_key:
+                return svc.label, par.pid
+        elif par.base in FRIENDLY:
+            return FRIENDLY[par.base], par.pid
+        elif par.base not in _PASS_THROUGH and par.base not in RUNTIMES and not is_noise(par):
+            return (par.name[:-4] if par.name.lower().endswith(".exe") else par.name), par.pid
+        cur = par
+    return "", None
+
+
+def service_launcher(service_procs: list, procs: dict, own_key: str | None = None):
+    """Launcher shared by a service's root processes (those whose parent is not part of the service)."""
+    own = {p.pid for p in service_procs}
+    for p in sorted(service_procs, key=lambda q: q.create_time or 0):
+        if p.ppid in own:
+            continue
+        label, pid = launcher_of(p, procs, own_key)
+        if label:
+            return label, pid
+    return "", None
 
 
 def cmdline_port(p: ProcInfo) -> int | None:
@@ -606,7 +678,7 @@ def preserve_selection(selected: Iterable[int], current: Iterable[int]) -> list[
 
 def is_shadow(p: ProcInfo) -> bool:
     exe = (p.exe or "").lower()
-    # note: on Shadow cloud PCs the Windows user is often called "Shadow", so C:\Users\Shadow\... must NOT count
+    # note: Meneer's Windows user is called "Shadow", so C:\Users\Shadow\... must NOT count
     return p.base.startswith("shadow") or "\\program files\\shadow\\" in exe or "\\blade group\\" in exe
 
 
@@ -624,6 +696,7 @@ class StopItem:
 class StopPlan:
     items: list                        # [StopItem] that will be stopped
     excluded_self: bool = False        # Process Radar itself was in the selection and was removed
+    excluded_parents: list = field(default_factory=list)  # processes that started Process Radar (left out)
     missing: list = field(default_factory=list)   # PIDs no longer in the snapshot
     warnings: list = field(default_factory=list)  # inline warning lines for the dialog
 
@@ -640,16 +713,35 @@ class StopPlan:
         return sum(i.rss for i in self.items)
 
 
+def ancestors(pid: int, procs: dict, max_depth: int = 16) -> list[int]:
+    """Parent chain of pid (nearest first); stops at a recycled parent PID (parent younger than child)."""
+    out, cur = [], procs.get(pid)
+    while cur is not None and len(out) < max_depth:
+        par = procs.get(cur.ppid)
+        if par is None or par.pid in out or par.pid == cur.pid or par.pid in (0, 4):
+            break
+        if par.create_time and cur.create_time and par.create_time > cur.create_time + 1:
+            break
+        out.append(par.pid)
+        cur = par
+    return out
+
+
 def stop_plan(pids: Iterable[int], procs: dict, self_pid: int | None = None) -> StopPlan:
-    """What a (bulk) stop of these PIDs would do: removes Process Radar itself, collects children
-    (not already selected) and flags Windows-system / Shadow processes."""
+    """What a (bulk) stop of these PIDs would do: removes Process Radar itself and the processes that
+    started it (stopping a py.exe launcher or a terminal can take Process Radar down with it), collects
+    children (not already selected) and flags Windows-system / Shadow processes."""
     plan = StopPlan(items=[])
     wanted = []
+    parents = set(ancestors(self_pid, procs)) if self_pid is not None else set()
     for pid in pids:
         if pid in wanted:
             continue
         if self_pid is not None and pid == self_pid:
             plan.excluded_self = True
+            continue
+        if pid in parents and pid in procs:
+            plan.excluded_parents.append(pid)
             continue
         if pid not in procs:
             plan.missing.append(pid)
@@ -658,7 +750,7 @@ def stop_plan(pids: Iterable[int], procs: dict, self_pid: int | None = None) -> 
     sel = set(wanted)
     for pid in wanted:
         p = procs[pid]
-        kids = [k for k in descendants(pid, procs) if k not in sel and k != self_pid]
+        kids = [k for k in descendants(pid, procs) if k not in sel and k != self_pid and k not in parents]
         warn = ""
         if is_noise(p):
             warn = "Windows system process"
@@ -668,6 +760,10 @@ def stop_plan(pids: Iterable[int], procs: dict, self_pid: int | None = None) -> 
                                    children=kids, warning=warn))
     if plan.excluded_self:
         plan.warnings.append("Process Radar itself is in the selection – it was left out (use Quit in the tray menu).")
+    if plan.excluded_parents:
+        names = ", ".join(f"{procs[p].name} ({p})" for p in plan.excluded_parents)
+        plan.warnings.append(f"Left out {names}: Process Radar was started from it, so stopping it could close "
+                             "Process Radar too. Quit Process Radar first, then stop it with Task Manager.")
     sysn = [i for i in plan.items if i.warning == "Windows system process"]
     shad = [i for i in plan.items if i.warning == "Shadow PC service"]
     if sysn:

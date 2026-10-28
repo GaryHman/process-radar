@@ -15,7 +15,10 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+import faulthandler
+import gc
 import getpass
+import hashlib
 import json
 import logging
 import os
@@ -158,6 +161,48 @@ def setup_logging(directory: Path) -> None:
         log.addHandler(logging.StreamHandler())
 
 
+_crash_file = None
+
+
+def install_crash_handlers(directory: Path) -> None:
+    """Never let a bug close the app silently.
+
+    * Python exceptions in Qt slots, timers and threads are logged (with traceback) and the app keeps
+      running - pythonw has no console, so without this they would vanish or end the process.
+    * A native crash (inside Qt) writes the Python stack of every thread to crash.log via faulthandler,
+      so the cause can be found afterwards."""
+    global _crash_file
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        log.error("Unhandled error (Process Radar keeps running)", exc_info=(exc_type, exc, tb))
+        win = getattr(hook, "window", None)
+        if win is not None:
+            try:
+                win.statusBar().showMessage(f"Something went wrong: {exc} (details in radar.log)", 10000)
+            except Exception:  # noqa: BLE001 - the window may be gone already
+                pass
+
+    def thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        log.error("Unhandled error in thread %s", getattr(args.thread, "name", "?"),
+                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = hook
+    threading.excepthook = thread_hook
+    try:
+        _crash_file = open(directory / "crash.log", "a", encoding="utf-8")
+        _crash_file.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} pid {os.getpid()} started\n")
+        _crash_file.flush()
+        faulthandler.enable(_crash_file, all_threads=True)
+    except OSError:
+        pass
+    install_crash_handlers.hook = hook
+
+
 class Settings:
     def __init__(self, path: Path):
         self.path = path
@@ -287,6 +332,33 @@ class Worker(QObject):
             self.failed.emit(str(e))
 
 
+class StopJob(QObject):
+    """Stops processes on a background thread, so the window stays responsive while programs are asked
+    to close (up to ~5 s) - a frozen window is what Windows offers to 'close the program' for."""
+    finished = Signal(object, object, object)    # results {pid: state}, names {pid: str}, error str | None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.busy = False
+
+    def start(self, pids, tree: bool, names: dict, expected: dict) -> bool:
+        if self.busy:
+            return False
+        self.busy = True
+
+        def run():
+            res, err = {}, None
+            try:
+                res = rcol.stop_many(pids, tree, timeout=3.0, expected=expected)
+            except Exception as e:  # noqa: BLE001 - never let a stop take the app down
+                log.exception("stop failed")
+                err = str(e)
+            self.finished.emit(res, names, err)
+
+        threading.Thread(target=run, name="stop-processes", daemon=True).start()
+        return True
+
+
 # ----------------------------------------------------------------------------- table model
 COLS = ["Name", "Label", "PID", "Command line", "Ports", "CPU %", "RAM", "VRAM", "Uptime"]
 C_NAME, C_LABEL, C_PID, C_CMD, C_PORTS, C_CPU, C_RAM, C_VRAM, C_UP = range(len(COLS))
@@ -303,14 +375,19 @@ class ProcModel(QAbstractTableModel):
         self.now = time.time()
         self.has_vram = False
         self.excluded = lambda exe: False          # set by the window from the Defender cache
+        self.launchers: dict = {}                  # pid -> (label, pid) of the app that started it
         self._shield = None
         self._link_font = QFont()
         self._link_font.setUnderline(True)
 
-    def set_rows(self, rows, now: float, has_vram: bool) -> None:
+    def set_rows(self, rows, now: float, has_vram: bool, procs: dict | None = None) -> None:
         """Incremental update (remove exited, update in place, append new) so the view's selection and
         current row survive every auto-refresh."""
         self.now, self.has_vram = now, has_vram
+        if procs is not None:
+            own = {r[0].pid: (rc.service_of(r[0]).key if rc.service_of(r[0]) else None) for r in rows}
+            self.launchers = {pid: rc.launcher_of(r[0], procs, own[pid]) for pid, r in
+                              ((r[0].pid, r) for r in rows)}
         new_by_key = {(r[0].pid, r[0].create_time): r for r in rows}
         for i in range(len(self.rows) - 1, -1, -1):
             p = self.rows[i][0]
@@ -394,6 +471,9 @@ class ProcModel(QAbstractTableModel):
                 return p.cmd_text or "(command line not readable – process runs as another user)"
             if col == C_NAME:
                 tip = f"{p.exe or p.name}\nListed because: {why}\nUser: {p.username or '?'}"
+                via, via_pid = self.launchers.get(p.pid, ("", None))
+                if via:
+                    tip += f"\nStarted by: {via} (PID {via_pid})"
                 if self.excluded(p.exe):
                     tip += "\n🛡 Excluded from Microsoft Defender scanning (last known exclusion list)"
                 return tip
@@ -492,12 +572,15 @@ class ServiceCard(QFrame):
         self.setProperty("running", on)
         detail = st.detail or (self.hint if not on else "")
         if on and not st.detail:
-            bits = [f"PID {', '.join(map(str, st.pids[:3]))}{'…' if len(st.pids) > 3 else ''}"]
+            bits = [] if st.launcher else [f"PID {', '.join(map(str, st.pids[:3]))}{'…' if len(st.pids) > 3 else ''}"]
             if st.uptime is not None:
                 bits.append("up " + rc.format_uptime(st.uptime))
             detail = " · ".join(bits)
+        if on and st.launcher:
+            detail = f"via {st.launcher}" + (" · " + detail if detail else "")
         self.detail.setText(rc.shorten(detail, 48))
-        self.detail.setToolTip(detail)
+        self.detail.setToolTip(detail + (f"\nStarted by {st.launcher} (PID {st.launcher_pid}), not by you directly."
+                                         if on and st.launcher else ""))
         if on:
             ports = " ".join(f'<a style="color:{C_LINK}" href="{u}">:{p}</a>' for p, u in st.ports[:4])
             if len(st.ports) > 4:
@@ -509,7 +592,10 @@ class ServiceCard(QFrame):
                                f'<span style="color:{C_MUTED}">{res}</span>')
         else:
             self.links.setText(f'<span style="color:#4b5563">default port {self._port_hint(st.key)}</span>')
-        tip = f"{st.label}: {st.hint}\nPIDs: {', '.join(map(str, st.pids)) or '–'}\nClick to show only these processes below."
+        tip = f"{st.label}: {st.hint}\nPIDs: {', '.join(map(str, st.pids)) or '–'}"
+        if on and st.launcher:
+            tip += f"\nStarted by: {st.launcher} (PID {st.launcher_pid})"
+        tip += "\nClick to show only these processes below."
         if on and not st.group:
             tip += "\nCtrl+click to stop the whole service. Right-click for more (Defender exclusions)."
 
@@ -851,7 +937,7 @@ class RadarWindow(QMainWindow):
         vs = self.table.verticalScrollBar().value()
         me = os.getpid()
         rows = [(p, why, rc.friendly_label(p, me)) for p, why in rc.background_rows(self.snap, self.show_all.isChecked())]
-        self.model.set_rows(rows, self.snap.taken_at or time.time(), bool(self.snap.vram_source))
+        self.model.set_rows(rows, self.snap.taken_at or time.time(), bool(self.snap.vram_source), self.snap.procs)
         # the incremental model update keeps the selection; re-apply it if a view change dropped rows
         keep = rc.preserve_selection(before, self.visible_keys())
         if set(self.selected_keys()) != set(keep):
@@ -943,7 +1029,8 @@ class RadarWindow(QMainWindow):
         n = len(procs)
         p = procs[0] if procs else None
         self.copy_btn.setEnabled(n >= 1)
-        self.stop_btn.setEnabled(n >= 1)
+        job = getattr(self, "stop_job", None)
+        self.stop_btn.setEnabled(n >= 1 and not (job is not None and job.busy))
         self.def_btn.setEnabled(n >= 1)
         self.open_btn.setEnabled(n == 1)
         self.web_btn.setEnabled(bool(n == 1 and p.listen))
@@ -1077,34 +1164,53 @@ class RadarWindow(QMainWindow):
     def stop_pids(self, pids, title: str = "") -> None:
         if not self.snap or not pids:
             return
+        job = getattr(self, "stop_job", None)
+        if job is not None and job.busy:
+            self.statusBar().showMessage("Still stopping the previous selection…", 4000)
+            return
         plan = rc.stop_plan(pids, self.snap.procs, os.getpid())
         if not plan.items:
             QMessageBox.information(self, APP_TITLE, "\n".join(plan.warnings) or "Nothing to stop.")
             return
         dlg = StopDialog(plan, self, title)
-        if dlg.exec() != QDialog.Accepted:
-            return
+        accepted = dlg.exec() == QDialog.Accepted
         tree = dlg.tree.isChecked()
+        dlg.deleteLater()                  # destroyed by Qt on this (GUI) thread, never by Python's GC
+        if not accepted:
+            return
+        procs = self.snap.procs
         names = {i.pid: f"{i.name} {('– ' + i.label) if i.label else ''}".strip() for i in plan.items}
         for i in plan.items:
             for k in i.children:
-                if k in self.snap.procs:
-                    names.setdefault(k, f"{self.snap.procs[k].name} (child of {i.pid})")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            results = rcol.stop_many(plan.pids, tree, timeout=3.0)
-        finally:
-            QApplication.restoreOverrideCursor()
+                if k in procs:
+                    names.setdefault(k, f"{procs[k].name} (child of {i.pid})")
+        expected = {pid: procs[pid].create_time for pid in plan.pids if pid in procs and procs[pid].create_time}
+        if job is None:
+            job = self.stop_job = StopJob(self)
+            job.finished.connect(self._on_stop_done)
+        n = len(plan.pids)
+        self.stop_btn.setEnabled(False)
+        self.statusBar().showMessage(f"Stopping {n} process{'es' if n != 1 else ''}…")
+        job.start(plan.pids, tree, names, expected)
+
+    def _on_stop_done(self, results, names, error) -> None:
+        self.stop_job.busy = False
+        self.update_actions()
+        if error:
+            log.error("Stop failed: %s", error)
+            self.statusBar().showMessage(f"Stop failed: {error}", 8000)
+            return
         text, counts = rc.stop_summary(results, names)
-        log.info("Bulk stop tree=%s -> %s", tree, results)
+        log.info("Bulk stop -> %s", results)
         box = QMessageBox(self)
+        box.setAttribute(Qt.WA_DeleteOnClose)
         box.setWindowTitle("Stop result")
         box.setIcon(QMessageBox.Information if not (counts["denied"] or counts["alive"]) else QMessageBox.Warning)
         head, _, rest = text.partition("\n")
         box.setText(f"<b>{head}</b>")
         box.setInformativeText("<pre style='font-family:Consolas,monospace'>" + rest.replace("&", "&amp;")
                                .replace("<", "&lt;") + "</pre>")
-        self.last_stop_box = box
+        self.last_stop_box = box               # for tests; Qt deletes the box when it is closed
         box.open()
         self.statusBar().showMessage(f"Stop: {head}", 8000)
         self.request_refresh(force=True)
@@ -1284,7 +1390,19 @@ class RadarApp(QObject):
         self.win.show()
         self.win.raise_()
         self.win.activateWindow()
+        if os.name == "nt":
+            bring_to_front(int(self.win.winId()))
         self.win.request_refresh(force=True)
+
+    def collect_garbage_on_gui_thread(self, interval_ms: int = 5000) -> None:
+        """Python's cyclic GC normally runs on whatever thread happens to allocate - often the data
+        thread. If it frees a Qt object there, Qt is left with a dangling timer and crashes later
+        (seen on 23 Oct 2026: access violation in Qt6Core while delivering a timer event). So the
+        automatic GC is switched off and run here, on the GUI thread, every few seconds instead."""
+        gc.disable()
+        self.gc_timer = QTimer(self)
+        self.gc_timer.timeout.connect(lambda: gc.collect())
+        self.gc_timer.start(interval_ms)
 
     def hide(self) -> None:
         self.win.save_geometry()
@@ -1338,6 +1456,9 @@ class RadarApp(QObject):
 
     def shutdown(self) -> None:
         self.timer.stop()
+        if getattr(self, "gc_timer", None) is not None:
+            self.gc_timer.stop()
+            gc.enable()
         self.hotkeys.unregister_all()
         if self.tray:
             self.tray.hide()
@@ -1345,19 +1466,65 @@ class RadarApp(QObject):
         self.thread.wait(5000)
 
 
-def server_name() -> str:
-    return f"ProcessRadar-{getpass.getuser()}"
-
-
-def notify_running_instance() -> bool:
-    sock = QLocalSocket()
-    sock.connectToServer(server_name())
-    if not sock.waitForConnected(500):
+def bring_to_front(hwnd: int) -> bool:
+    """Really activate our window. Windows only lets the app that has the focus hand it over; Qt's
+    activateWindow() alone just flashes the taskbar button. Joining the input queue of the current
+    foreground window for a moment is the standard, documented way around that."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        for fn in (u32.IsIconic, u32.ShowWindow, u32.BringWindowToTop, u32.SetForegroundWindow):
+            fn.argtypes = [wintypes.HWND] + ([ctypes.c_int] if fn is u32.ShowWindow else [])
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)                  # SW_RESTORE
+        fg = u32.GetForegroundWindow()
+        if fg == hwnd:
+            return True
+        me = k32.GetCurrentThreadId()
+        other = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+        attached = bool(other and other != me and u32.AttachThreadInput(me, other, True))
+        try:
+            u32.BringWindowToTop(hwnd)
+            ok = bool(u32.SetForegroundWindow(hwnd))
+        finally:
+            if attached:
+                u32.AttachThreadInput(me, other, False)
+        return ok
+    except Exception:  # noqa: BLE001 - cosmetic; never fail a show() because of this
         return False
-    sock.write(b"show")
-    sock.waitForBytesWritten(500)
-    sock.disconnectFromServer()
-    return True
+
+
+def server_name() -> str:
+    """One instance per Windows user *and* settings folder (a test copy with --data-dir never talks to,
+    or removes the pipe of, the real app)."""
+    tag = hashlib.sha1(str(data_dir().resolve()).lower().encode("utf-8")).hexdigest()[:8]
+    return f"ProcessRadar-{getpass.getuser()}-{tag}"
+
+
+def notify_running_instance(attempts: int = 6, wait_ms: int = 500) -> bool:
+    """Ask the running instance to show its window. Retries for ~3 s: the first instance may still be
+    starting up (lock taken, pipe not listening yet)."""
+    if os.name == "nt":
+        try:   # let the running instance take the foreground (Windows blocks that for background apps)
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)    # ASFW_ANY
+        except Exception:  # noqa: BLE001
+            pass
+    for i in range(attempts):
+        sock = QLocalSocket()
+        sock.connectToServer(server_name())
+        if sock.waitForConnected(wait_ms):
+            sock.write(b"show")
+            sock.waitForBytesWritten(500)
+            sock.disconnectFromServer()
+            return True
+        if i + 1 < attempts:
+            time.sleep(wait_ms / 1000.0)
+    return False
 
 
 def main(argv=None) -> int:
@@ -1370,6 +1537,7 @@ def main(argv=None) -> int:
         os.environ["PR_DATA_DIR"] = args.data_dir
     directory = data_dir()
     setup_logging(directory)
+    install_crash_handlers(directory)
 
     QApplication.setQuitOnLastWindowClosed(False)
     qapp = QApplication(sys.argv[:1])
@@ -1384,13 +1552,16 @@ def main(argv=None) -> int:
             pass
 
     lock = QLockFile(str(directory / "app.lock"))
+    lock.setStaleLockTime(0)               # a lock is only stale if its process is gone (QLockFile checks)
     if not lock.tryLock(200):
         if notify_running_instance():
             log.info("Already running - asked the running instance to show its window")
             return 0
         lock.removeStaleLockFile()
         if not lock.tryLock(200):
-            QMessageBox.information(None, APP_TITLE, "Process Radar is already running (see the tray icon).")
+            # Another instance holds the lock but did not answer (still starting, or busy). Starting a
+            # second copy or showing an error would both be wrong: log it and leave quietly.
+            log.warning("Already running, but the running instance did not answer - not starting twice")
             return 0
     try:
         QLocalServer.removeServer(server_name())
@@ -1398,6 +1569,8 @@ def main(argv=None) -> int:
         server.listen(server_name())
         settings = Settings(directory / "settings.json")
         app = RadarApp(qapp, settings)
+        app.collect_garbage_on_gui_thread()
+        install_crash_handlers.hook.window = app.win
 
         def on_conn():
             while server.hasPendingConnections():

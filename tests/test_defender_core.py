@@ -8,7 +8,7 @@ import tempfile
 import pytest
 
 import radar_core as rc
-from fakes import COMFY, P, demo_snapshot
+from fakes import COMFY, P, meneer_snapshot
 
 ODD = "C:\\Program Files\\O'Brien’s Tools $x `y\\a b.exe"      # apostrophe, curly quote, $, backtick, spaces
 
@@ -29,9 +29,9 @@ def test_dedupe_by_exe_and_interpreter_flag():
 
 
 def test_service_exe_paths():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     ol = rc.exe_paths_of_service(snap, "ollama")
-    assert [x.exe for x in ol] == [r"C:\Users\Alex\AppData\Local\Programs\Ollama\ollama.exe"]  # runner has no exe in fake
+    assert [x.exe for x in ol] == [r"C:\Users\Shadow\AppData\Local\Programs\Ollama\ollama.exe"]  # runner has no exe in fake
     lu = rc.exe_paths_of_service(snap, "locallyuncensored")
     assert {x.name for x in lu} == {"locally-uncensored.exe", "lu-llama-server.exe", "python.exe"}  # + its children
     comfy = rc.exe_paths_of_service(snap, "comfyui")
@@ -58,10 +58,10 @@ def test_selection_to_change_dedupes_folders():
 
 
 def test_script_contains_only_quoted_paths():
-    ch = rc.ExclusionChange([ODD], [r"C:\Users\Alex\Documents\My Tools"])
-    s = rc.build_apply_script(ch, r"C:\Users\Alex\AppData\Roaming\ProcessRadar\defender-result.json")
+    ch = rc.ExclusionChange([ODD], [r"C:\Users\Shadow\Documents\My Tools"])
+    s = rc.build_apply_script(ch, r"C:\Users\Shadow\AppData\Roaming\ProcessRadar\defender-result.json")
     assert "Add-MpPreference -ExclusionProcess " + rc.ps_single_quote(ODD) in s
-    assert "Add-MpPreference -ExclusionPath 'C:\\Users\\Alex\\Documents\\My Tools'" in s
+    assert "Add-MpPreference -ExclusionPath 'C:\\Users\\Shadow\\Documents\\My Tools'" in s
     # the raw path never appears unquoted (e.g. inside a double-quoted string)
     assert s.count(ODD) == 0
     assert "Remove-MpPreference" not in s and "\r\n" in s

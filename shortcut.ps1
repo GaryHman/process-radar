@@ -1,8 +1,9 @@
 # Creates (or removes) a "Process Radar" shortcut that starts pythonw.exe + process_radar.py directly.
 #   powershell -NoProfile -ExecutionPolicy Bypass -File shortcut.ps1 -Folder Programs|Startup|Desktop [-Remove]
-#   powershell -NoProfile -ExecutionPolicy Bypass -File shortcut.ps1 -Dir "D:\My Desktop"
-# An existing shortcut with the same name is never overwritten: if it is ours it is kept, otherwise the
-# script stops with exit code 2 so you can decide. It never points at a .venv (the folder is synced).
+#   powershell -NoProfile -ExecutionPolicy Bypass -File shortcut.ps1 -Dir "G:\My Drive\GoogleDrive\0 Desktop"
+# An existing Process Radar shortcut is kept when it is up to date and repaired when it points at an old
+# folder (e.g. after the app was moved); any other shortcut with that name is never overwritten (exit 2).
+# It never points at a .venv (the folder is synced).
 param(
     [ValidateSet('Programs', 'Startup', 'Desktop')][string]$Folder = 'Programs',
     [string]$Dir = '',
@@ -29,7 +30,7 @@ function Test-Py([string]$exe) {
     return ($LASTEXITCODE -eq 0)
 }
 if (-not $Pythonw) {
-    $cands = @()
+    $cands = @('C:\Python314\python.exe')
     try { $cands += (& py -3 -c "import sys;print(sys.executable)" 2>$null).Trim() } catch { }
     foreach ($c in @(Get-Command python -All -ErrorAction SilentlyContinue)) { $cands += $c.Source }
     foreach ($c in $cands) {
@@ -40,11 +41,21 @@ if (-not $Pythonw -or -not (Test-Path -LiteralPath $Pythonw)) {
     throw "No Python with PySide6 + psutil found. Run: py -m pip install --user psutil PySide6-Essentials"
 }
 if ($Pythonw -like '*\.venv\*') { throw "Refusing to use a .venv Python (synced folder): $Pythonw" }
+$verb = 'Created'
 if (Test-Path -LiteralPath $lnk) {
     $cur = $sh.CreateShortcut($lnk)
-    if ($cur.Arguments -like "*process_radar.py*") { Write-Host "Already exists (kept): $lnk -> $($cur.TargetPath) $($cur.Arguments)"; exit 0 }
-    Write-Host "A different shortcut named 'Process Radar' already exists, NOT overwritten: $lnk -> $($cur.TargetPath) $($cur.Arguments)"
-    exit 2
+    if ($cur.Arguments -notlike "*process_radar.py*") {
+        Write-Host "A different shortcut named 'Process Radar' already exists, NOT overwritten: $lnk -> $($cur.TargetPath) $($cur.Arguments)"
+        exit 2
+    }
+    $want = '"' + $script + '"'
+    if ($cur.Arguments -eq $want -and $cur.TargetPath -eq $Pythonw -and $cur.WorkingDirectory -eq $appDir) {
+        Write-Host "Up to date (kept): $lnk -> $($cur.TargetPath) $($cur.Arguments)"
+        exit 0
+    }
+    # ours, but pointing at an old location (the folder was moved) or another Python: update it in place
+    Write-Host "Updating (was: $($cur.TargetPath) $($cur.Arguments))"
+    $verb = 'Updated'
 }
 $s = $sh.CreateShortcut($lnk)
 $s.TargetPath = $Pythonw
@@ -54,4 +65,4 @@ $s.IconLocation = (Join-Path $appDir 'icon.ico') + ',0'
 $s.Description = 'Process Radar - see what is running in the background'
 $s.Save()
 $chk = $sh.CreateShortcut($lnk)
-Write-Host "Created $lnk -> $($chk.TargetPath) $($chk.Arguments) (icon $($chk.IconLocation))"
+Write-Host "$verb $lnk -> $($chk.TargetPath) $($chk.Arguments) (icon $($chk.IconLocation))"

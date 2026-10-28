@@ -1,5 +1,5 @@
 import radar_core as rc
-from fakes import MB, P, demo_snapshot
+from fakes import MB, P, meneer_snapshot
 
 
 def test_preserve_selection_keeps_order_and_drops_exited():
@@ -11,7 +11,7 @@ def test_preserve_selection_keeps_order_and_drops_exited():
 
 
 def test_stop_plan_excludes_self_and_flags_system_and_shadow():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     plan = rc.stop_plan([8304, 9196, 1316, 10336, 8304, 424242], snap.procs, self_pid=9196)
     assert plan.pids == [8304, 1316, 10336]
     assert plan.excluded_self and plan.missing == [424242]
@@ -23,7 +23,7 @@ def test_stop_plan_excludes_self_and_flags_system_and_shadow():
 
 
 def test_stop_plan_children_and_kill_tree_default():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     plan = rc.stop_plan([8304, 30000], snap.procs)
     kids = {i.pid: i.children for i in plan.items}
     assert kids == {8304: [7564], 30000: []} and plan.any_children
@@ -37,7 +37,7 @@ def test_stop_plan_children_and_kill_tree_default():
 
 
 def test_stop_plan_only_self():
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     plan = rc.stop_plan([30000], snap.procs, self_pid=30000)
     assert plan.items == [] and plan.excluded_self
 

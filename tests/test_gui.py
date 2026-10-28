@@ -2,7 +2,7 @@ import time
 
 from PySide6.QtCore import Qt
 
-from fakes import FakeCollector, demo_snapshot
+from fakes import FakeCollector, meneer_snapshot
 
 
 def make_app(qapp, tmpenv):
@@ -57,7 +57,7 @@ def test_window_shows_services_and_rows(qapp, tmpenv):
         assert w.proxy.index(0, 0).data(pr.PID_ROLE) == 8304
         # selection survives a refresh
         w.select_pid(8304)
-        w.on_snapshot(demo_snapshot())
+        w.on_snapshot(meneer_snapshot())
         assert w.selected_pid() == 8304
         assert w.stop_btn.isEnabled() and "8304" in w.stop_btn.text() and w.web_btn.isEnabled()
         # tooltips: full command line on hover
@@ -131,12 +131,12 @@ def test_multiselect_survives_refresh(qapp, tmpenv):
         assert w.stop_btn.text() == "■  Stop 3 processes…" and "3 selected" in w.count_label.text()
         assert not w.open_btn.isEnabled() and w.copy_btn.isEnabled()
         # refresh 1: same processes, new numbers (re-sort happens)
-        snap = demo_snapshot()
+        snap = meneer_snapshot()
         snap.procs[30000].rss = 5000 * 1024 * 1024
         w.on_snapshot(snap)
         assert set(w.selected_pids()) == {8304, 14672, 30000}
         # refresh 2: 30000 exited, a new process appeared, another unselected one exited
-        snap2 = demo_snapshot()
+        snap2 = meneer_snapshot()
         del snap2.procs[30000]
         del snap2.procs[6840]
         snap2.procs[40000] = copy.copy(snap2.procs[9196])
@@ -145,7 +145,7 @@ def test_multiselect_survives_refresh(qapp, tmpenv):
         assert set(w.selected_pids()) == {8304, 14672}
         assert w.stop_btn.text() == "■  Stop 2 processes…"
         # refresh 3: PID 14672 reused by a different process (new start time) -> dropped
-        snap3 = demo_snapshot()
+        snap3 = meneer_snapshot()
         del snap3.procs[30000]
         snap3.procs[14672].create_time += 99
         w.on_snapshot(snap3)
@@ -153,7 +153,7 @@ def test_multiselect_survives_refresh(qapp, tmpenv):
         assert w.stop_btn.text().startswith("■  Stop python.exe (8304)")
         # selection also survives a search filter that hides and re-shows nothing selected
         w.select_pids([8304, 9196])
-        w.on_snapshot(demo_snapshot())
+        w.on_snapshot(meneer_snapshot())
         assert set(w.selected_pids()) == {8304, 9196}
         # Ctrl+A selects every visible row
         w.table.setFocus()
@@ -184,8 +184,8 @@ def test_bulk_stop_flow(qapp, tmpenv, monkeypatch):
         monkeypatch.setattr(pr.StopDialog, "exec", fake_exec)
         calls = []
 
-        def fake_stop_many(pids, tree, timeout=3.0, protect=None):
-            calls.append((list(pids), tree))
+        def fake_stop_many(pids, tree, timeout=3.0, protect=None, expected=None):
+            calls.append((list(pids), tree, dict(expected or {})))
             return {pids[0]: "stopped", pids[1]: "denied", 7564: "stopped"}
         monkeypatch.setattr(rcol, "stop_many", fake_stop_many)
         monkeypatch.setattr(pr.os, "getpid", lambda: 30000)   # pretend BigIdle is Process Radar itself
@@ -196,7 +196,11 @@ def test_bulk_stop_flow(qapp, tmpenv, monkeypatch):
         assert seen["tree"] is True                            # ComfyUI has a child
         assert any("Process Radar itself" in t for t in seen["warn"])
         assert any("Shadow" in t for t in seen["warn"])
+        # the stop runs on a background thread; the result arrives back on the GUI thread
+        assert pump(qapp, lambda: getattr(w, "last_stop_box", None) is not None)
         assert calls and set(calls[0][0]) == {8304, 10336} and calls[0][1] is True
+        assert calls[0][2] == {8304: w.snap.procs[8304].create_time, 10336: w.snap.procs[10336].create_time}
+        assert not w.stop_job.busy
         box = w.last_stop_box
         assert "2 stopped, 1 access denied" in box.text()
         assert "access denied" in box.informativeText() and "child of 8304" in box.informativeText()
@@ -232,7 +236,7 @@ def test_ctrl_click_card_stops_service(qapp, tmpenv, monkeypatch):
 def test_stop_dialog_real_widget(qapp):
     import process_radar as pr
     import radar_core as rc
-    snap = demo_snapshot()
+    snap = meneer_snapshot()
     dlg = pr.StopDialog(rc.stop_plan([8304, 1316], snap.procs, self_pid=None))
     assert dlg.table.rowCount() == 2 and dlg.tree.isChecked()
     assert dlg.stop_btn.text() == "Stop 2" and dlg.windowTitle() == "Stop processes?"
@@ -400,7 +404,7 @@ def test_defender_dialog_shows_full_path_with_elide_middle(qapp, tmpenv):
             assert "ComfyUI" in dlg.table.item(r, 2).text() or "Ollama" in dlg.table.item(r, 2).text() \
                 or "ollama" in dlg.table.item(r, 2).text().lower() or "python" in dlg.table.item(r, 2).text().lower()
         # Manage list also elides in the middle and keeps the full value in the tooltip
-        app.def_cache.processes = [r"C:\Users\Alex\AppData\Local\Programs\Ollama\ollama.exe"]
+        app.def_cache.processes = [r"C:\Users\Shadow\AppData\Local\Programs\Ollama\ollama.exe"]
         app.def_cache.updated = 1
         mgr = defui.ManageExclusionsDialog(app.def_cache, app.def_job, app.win)
         assert mgr.table.textElideMode() == Qt.ElideMiddle

@@ -247,6 +247,8 @@ def stop_process(pid: int, tree: bool, timeout: float = 4.0) -> tuple[list[int],
     Returns (stopped_pids, error_messages)."""
     if pid == os.getpid():
         return [], ["Process Radar will not stop itself - use Quit in its tray menu."]
+    if pid in self_and_ancestors():
+        return [], ["Process Radar was started from this process; stopping it could close Process Radar too."]
     try:
         root = psutil.Process(pid)
     except psutil.NoSuchProcess:
@@ -254,7 +256,7 @@ def stop_process(pid: int, tree: bool, timeout: float = 4.0) -> tuple[list[int],
     targets = []
     if tree:
         try:
-            targets = root.children(recursive=True)
+            targets = [c for c in root.children(recursive=True) if c.pid != os.getpid()]
         except psutil.Error:
             targets = []
     targets.append(root)
@@ -279,11 +281,39 @@ def stop_process(pid: int, tree: bool, timeout: float = 4.0) -> tuple[list[int],
     return sorted(p.pid for p in list(gone) + list(gone2)), errors
 
 
-def stop_many(pids, tree: bool, timeout: float = 3.0, protect=None) -> dict[int, str]:
+def self_and_ancestors() -> set[int]:
+    """Process Radar's own PID plus the processes that started it (py.exe launchers, terminals, ...).
+    Stopping one of those can take Process Radar down with it (py.exe kills its child through a job object)."""
+    out = {os.getpid()}
+    try:
+        cur = psutil.Process()
+        for _ in range(16):
+            par = cur.parent()
+            if par is None or par.pid in out or par.pid in (0, 4):
+                break
+            try:
+                if par.create_time() > cur.create_time() + 1:   # recycled parent PID
+                    break
+            except psutil.Error:
+                break
+            out.add(par.pid)
+            cur = par
+    except psutil.Error:
+        pass
+    return out
+
+
+def stop_many(pids, tree: bool, timeout: float = 3.0, protect=None, expected=None) -> dict[int, str]:
     """Bulk stop. Terminates every target (children first when tree=True), waits up to `timeout`
     seconds, then kills whatever is still alive. Returns {pid: state} with state one of
-    stopped / gone / denied / alive / refused (see radar_core.stop_summary)."""
-    protect = set(protect or ()) | {os.getpid()}
+    stopped / gone / denied / alive / refused (see radar_core.stop_summary).
+
+    protect:  PIDs never touched (Process Radar itself and its parents are always protected).
+    expected: {pid: create_time} from the snapshot the user looked at. If a PID now belongs to a
+              *different* process (Windows recycles PIDs quickly) it is reported as gone, not killed.
+    Never raises: every psutil error is turned into a state."""
+    protect = set(protect or ()) | self_and_ancestors()
+    expected = expected or {}
     results: dict[int, str] = {}
     targets: dict[int, psutil.Process] = {}
     for pid in pids:
@@ -292,11 +322,18 @@ def stop_many(pids, tree: bool, timeout: float = 3.0, protect=None) -> dict[int,
             continue
         try:
             root = psutil.Process(pid)
+            want = expected.get(pid)
+            if want and abs(root.create_time() - want) > 1.0:
+                results[pid] = "gone"           # the process the user saw has exited; PID reused
+                continue
         except psutil.NoSuchProcess:
             results[pid] = "gone"
             continue
         except psutil.AccessDenied:
             results[pid] = "denied"
+            continue
+        except psutil.Error:
+            results[pid] = "gone"
             continue
         if tree:
             try:
@@ -315,7 +352,12 @@ def stop_many(pids, tree: bool, timeout: float = 3.0, protect=None) -> dict[int,
             results[pid] = "gone"
         except psutil.AccessDenied:
             results[pid] = "denied"
-    gone, alive = psutil.wait_procs(asked, timeout=timeout)
+        except psutil.Error:
+            results[pid] = "gone"
+    try:
+        gone, alive = psutil.wait_procs(asked, timeout=timeout)
+    except psutil.Error:
+        gone, alive = [], list(asked)
     for p in gone:
         results[p.pid] = "stopped"
     for p in alive:
@@ -325,11 +367,16 @@ def stop_many(pids, tree: bool, timeout: float = 3.0, protect=None) -> dict[int,
             pass
         except psutil.AccessDenied:
             results[p.pid] = "denied"
-    gone2, alive2 = psutil.wait_procs([p for p in alive if p.pid not in results], timeout=2)
+        except psutil.Error:
+            pass
+    try:
+        gone2, alive2 = psutil.wait_procs([p for p in alive if p.pid not in results], timeout=2)
+    except psutil.Error:
+        gone2, alive2 = [], [p for p in alive if p.pid not in results]
     for p in gone2:
         results[p.pid] = "stopped"
     for p in alive2:
-        results[p.pid] = "alive"
+        results[p.pid] = "alive" if p.is_running() else "stopped"
     return results
 
 

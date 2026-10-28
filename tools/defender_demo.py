@@ -44,9 +44,9 @@ def main(out):
             break
     w.request_refresh(force=True)
     pump(qapp, 2.5)
-    # Prefer a Windows-looking selection so the screenshot matches a typical AI-workstation PC. On Linux (box) inject fakes.
-    from tests.fakes import demo_snapshot
-    fake = demo_snapshot()
+    # Prefer a Windows-looking selection so the screenshot matches Meneer's PC. On Linux (box) inject fakes.
+    from tests.fakes import meneer_snapshot
+    fake = meneer_snapshot()
     pick = [fake.procs[k] for k in (14672, 8304, 9196, 8184, 5848, 9784) if k in fake.procs]
     # also include a couple of live ones so the background table is not empty of selection
     live = [p for p in w.snap.procs.values() if p.exe][:2]

@@ -1,4 +1,4 @@
-"""A snapshot that looks like a typical AI-workstation PC on 22 Oct 2026 (from Get-CimInstance / netstat / PDH)."""
+"""A snapshot that looks like Meneer's PC on 22 Oct 2026 (from Get-CimInstance / netstat / PDH)."""
 import time
 
 import radar_core as rc
@@ -12,15 +12,15 @@ def P(pid, name, cmd=(), exe="", ppid=1, listen=(), vram=None, cpu=0.0, rss=50 *
                        cpu=cpu, rss=rss, listen=list(listen), vram=vram, has_window=win)
 
 
-COMFY = r"C:\Users\Alex\Documents\ComfyUI_windows_portable_nvidia"
+COMFY = r"C:\Users\Shadow\Documents\ComfyUI_windows_portable_nvidia"
 
 
-def demo_snapshot(vram=True):
+def meneer_snapshot(vram=True):
     procs = [
         P(4, "System", listen=[("10.0.5.10", 139), ("::", 445)]),
         P(1316, "svchost.exe", exe=r"C:\Windows\System32\svchost.exe", listen=[("0.0.0.0", 135)]),
         P(10648, "explorer.exe", exe=r"C:\Windows\explorer.exe", win=True, rss=300 * MB),
-        P(14672, "ollama.exe", ["ollama", "serve"], exe=r"C:\Users\Alex\AppData\Local\Programs\Ollama\ollama.exe",
+        P(14672, "ollama.exe", ["ollama", "serve"], exe=r"C:\Users\Shadow\AppData\Local\Programs\Ollama\ollama.exe",
           listen=[("::", 11434)], vram=0, age=7200),
         P(15000, "ollama.exe", [r"C:\...\ollama.exe", "runner", "--model", "x", "--port", "50123"], ppid=14672,
           listen=[("127.0.0.1", 50123)], vram=5200 * MB),
@@ -33,7 +33,7 @@ def demo_snapshot(vram=True):
         P(7564, "conhost.exe", ["conhost.exe"], exe=r"C:\Windows\System32\conhost.exe", ppid=8304),
         P(5848, "lu-llama-server.exe", exe=r"C:\Program Files\Locally Uncensored\lu-llama-server.exe", ppid=8184,
           listen=[("127.0.0.1", 8128)]),
-        P(9784, "opencode-cli.exe", [r"C:\Users\Alex\AppData\Roaming\ai.opencode.desktop\cli\2.1.1-x64\opencode-cli.exe",
+        P(9784, "opencode-cli.exe", [r"C:\Users\Shadow\AppData\Roaming\ai.opencode.desktop\cli\2.1.1-x64\opencode-cli.exe",
                                      "serve", "--service"], listen=[("0.0.0.0", 4096)]),
         P(9196, "node.exe", [r"C:\Program Files\nodejs\node.exe", r"C:\Program Files\nodejs\node_modules\npm\bin\npx-cli.js",
                              "--yes"], exe=r"C:\Program Files\nodejs\node.exe"),
@@ -56,7 +56,7 @@ def demo_snapshot(vram=True):
 
 class FakeCollector:
     def __init__(self, snap=None):
-        self.snap = snap or demo_snapshot()
+        self.snap = snap or meneer_snapshot()
         self.calls = 0
 
     def snapshot(self):
